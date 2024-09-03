@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useState, useRef, useCallback, Suspense } from 'react';
+import React, { useEffect, useState, useRef, useCallback, Suspense, ChangeEvent } from 'react';
 import io from 'socket.io-client';
 import { useSearchParams } from 'next/navigation';
 import "@/app/globals.css";
@@ -16,6 +16,8 @@ interface Message {
 
 interface SocketError {
     message: string;
+    COOLDOWN_MS: number;
+    type: string;
 }
 
 const Chat: React.FC = () => {
@@ -41,11 +43,21 @@ const Chat: React.FC = () => {
 
     const [error, setError] = useState<string | null>(null);
     const [loadingRoom, setLoadingRoom] = useState<boolean>(true);
+    const [rateLimitMessage, setRateLimitMessage] = useState<string>('');
+    const [rateLimit, setRateLimit] = useState<boolean>(false);
 
     const messageTextareaRef = useRef<HTMLTextAreaElement | null>(null);
     const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
-    const generate_uuid = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => (c === 'x' ? Math.random() * 16 | 0 : (Math.random() * 16 | 0) & 3 | 8).toString(16));
+    useEffect(() => {
+        if (messagesEndRef.current) {
+            requestAnimationFrame(() => {
+                messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+            });
+        }
+    }, [isInRoom]);
+
+    const generateUUID = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => (c === 'x' ? Math.random() * 16 | 0 : (Math.random() * 16 | 0) & 3 | 8).toString(16));
 
     const updateUsername  = (username: string) => {
         setUsername(username);
@@ -54,12 +66,13 @@ const Chat: React.FC = () => {
             setError('Username must be between 3 and 14 characters.');
             return;
         }
+
         setUsernameColor(getRandomColor());
         localStorage.setItem('username', username);
         setError('');
         if(localStorage.getItem('userId')) return;
 
-        const newUserId = generate_uuid().toString();
+        const newUserId = generateUUID();
         setUserId(newUserId);
         localStorage.setItem('userId', newUserId);
     };
@@ -95,40 +108,40 @@ const Chat: React.FC = () => {
     const sendMessage = useCallback(() => {
         if (message.trim() && username && roomId) {
             const msg: Message = { text: message, user: username, timestamp: new Date().toISOString() };
+
+            console.log(message.trim(), username, roomId, msg);
             socket.emit('chat message', msg);
-            setMessage('');
-            if (messageTextareaRef.current) {
-                messageTextareaRef.current.style.height = 'auto';
-            }
+
+            if(rateLimitMessage.length === 0) setMessage('');
+            if (messageTextareaRef.current) messageTextareaRef.current.style.height = 'auto';
         }
-    }, [message, username, roomId]);
+    }, [message, username, roomId, rateLimitMessage]);
 
-    useEffect(() => {
-        const handleInput = () => {
-            if (messageTextareaRef.current) {
-                const textarea = messageTextareaRef.current;
-                textarea.style.height = 'auto';
-                const lineHeight = parseFloat(getComputedStyle(textarea).lineHeight);
-                textarea.style.height = `${Math.max(textarea.scrollHeight, lineHeight)}px`;
-                textarea.style.overflowY = textarea.scrollHeight > lineHeight * 3 ? 'auto' : 'hidden';
-            }
-        };
-
+    const handleMessageInput = () => {
         const textarea = messageTextareaRef.current;
         if (textarea) {
-            textarea.addEventListener('input', handleInput);
-            handleInput();
-        }
+            textarea.style.height = 'auto';
 
-        return () => {
-            if (textarea) {
-                textarea.removeEventListener('input', handleInput);
-            }
-        };
+            const computedStyle = getComputedStyle(textarea);
+            const lineHeight = parseFloat(computedStyle.lineHeight);
+            const maxHeight = lineHeight * 3; // Show scrollbar if content exceeds 3 lines
+
+            textarea.style.height = `${Math.max(textarea.scrollHeight - 16, lineHeight)}px`;
+
+            textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden';
+        }
+    };
+
+    const handleMessageInputChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
+        setMessage(e.target.value);
+        handleMessageInput();
+    };
+
+    useEffect(() => {
+        handleMessageInput();
     }, []);
 
     useEffect(() => {
-        setLoadingRoom(true);
         const handleConnect = () => {
             console.log('Connected to the server.');
             setIsConnected(true);
@@ -144,23 +157,37 @@ const Chat: React.FC = () => {
             }
         };
 
+        const handleRateLimitError = (error: SocketError) => {
+            setRateLimitMessage(error.message);
+            setRateLimit(true);
+            setTimeout(() => {
+                setRateLimit(false);
+                setRateLimitMessage('');
+            }, error.COOLDOWN_MS);
+        };
+
         const handleMessage = (message: Message) => setMessages(prevMessages => [...prevMessages, message]);
         const handlePreviousMessages = (messages: Message[]) => setMessages(messages);
         const handleError = (error: SocketError) => {
-            setError(error.message);
-            setIsInRoom(false);
-            setLoadingRoom(false);
+            switch(error.type) {
+                case 'cooldown':
+                case 'msg_length_limit':
+                    handleRateLimitError(error);
+                    break;
+                default:
+                    setError(error.message);
+                    setIsInRoom(false);
+                    setLoadingRoom(false);
+            }
         };
 
         const handleDisconnect = () => {
-            console.log('Socket disconnected');
             setIsConnected(false);
             setTransport('N/A');
             setIsInRoom(false);
         };
 
         const handleRoomJoined = (room: string, isRoomCreator: boolean) => {
-            console.log(`Joined room: ${room}`);
             isRoomCreator ? setIsRoomCreator(true) : setIsRoomCreator(false);
             setTransport(socket.io.engine.transport.name);
             setRoomId(room);
@@ -185,7 +212,6 @@ const Chat: React.FC = () => {
         socket.on('error', handleError);
 
         return () => {
-            console.log('Cleaning up socket listeners');
             socket.off('connect', handleConnect);
             socket.off('disconnect', handleDisconnect);
             socket.off('roomJoined', handleRoomJoined);
@@ -225,7 +251,6 @@ const Chat: React.FC = () => {
     };
 
     const createRoom = () => {
-        console.log(userId, 'userid');
         socket.emit('createRoom', userId);
         socket.once('roomCreated', (room: React.SetStateAction<string | null>) => {
             setRoomId(room);
@@ -328,59 +353,52 @@ const Chat: React.FC = () => {
                                 </span>
                             </div>
                         )}
-                        <div className={`h-full flex flex-col ${loadingRoom ? 'overflow-hidden': 'overflow-auto'} relative custom-scrollbar`}>
-                            <article className={`${isSidebarOpen ? 'max-w-[600px]' : 'max-w-[700px]'} mx-auto pb-4 flex flex-col relative w-full flex-1`}>
-                                <div id="messages" className="flex flex-col flex-1 overflow-auto p-4">
-                                    {loadingRoom ? (
-                                        <div className="flex items-center justify-center h-[85vh] w-full">
-                                            <Loading />
-                                        </div>
-                                    ) : error ? (
-                                        <div className="text-red-500 text-center mt-4">{error}</div>
-                                    ) : isInRoom ? (
-                                        <>
-                                            {messages.map((msg, index) => (
-                                                <div key={index} className="text-white whitespace-pre-wrap mb-1">
-                                                    <div className="text-[1rem]" style={{ color: `${usernameColor}` }}>
-                                                        {msg.user} <span className="text-gray-400 text-xs">{formatTimestamp(msg.timestamp)}</span>
-                                                    </div>
-                                                    <span className='text-xs'>{msg.text}</span>
+                    <div className={`h-full flex flex-col ${loadingRoom ? 'overflow-hidden' : 'overflow-auto'} relative custom-scrollbar`}>
+                        <article className={`${isSidebarOpen ? 'max-w-[600px]' : 'max-w-[700px]'} mx-auto pb-4 flex flex-col relative w-full flex-1 overflow-hidden custom-scrollbar`}>
+                            <div id="messages" className="flex flex-col flex-1 overflow-auto p-4 custom-scrollbar">
+                                {loadingRoom ? (
+                                    <div className="flex items-center justify-center h-[85vh] w-full">
+                                        <Loading />
+                                    </div>
+                                ) : error ? (
+                                    <div className="text-red-500 text-center mt-4">{error}</div>
+                                ) : isInRoom ? (
+                                    <>
+                                        {messages.map((msg, index) => (
+                                            <div key={index} className="text-white whitespace-pre-wrap mb-1 break-words">
+                                                <div className="text-[1rem]" style={{ color: `${usernameColor}` }}>
+                                                    {msg.user} <span className="text-gray-400 text-xs">{formatTimestamp(msg.timestamp)}</span>
                                                 </div>
-                                            ))}
-                                            <div ref={messagesEndRef} />
-                                        </>
-                                    ) : (
-                                        <>
-                                            <div className="flex flex-col items-center justify-center h-full">
-                                                <button className="hover:bg-primary-white transition-all ease-out duration-200 px-4 py-2 text-white border border-secondary-white rounded-full font-semibold focus:outline-none" onClick={createRoom}>
-                                                    Create Room
-                                                </button>
+                                                <span className='text-xs'>{msg.text}</span>
                                             </div>
-                                            <p className='animate-pulse mt-10 text-red-600 text-center'>Room will be deleted after 1 hour of inactivity</p>
-                                        </>
-                                    )}
+                                        ))}
+                                        <div ref={messagesEndRef} />
+                                    </>
+                                ) : (
+                                    <>
+                                        <div className="flex flex-col items-center justify-center h-full">
+                                            <button className="hover:bg-primary-white transition-all ease-out duration-200 px-4 py-2 text-white border border-secondary-white rounded-full font-semibold focus:outline-none" onClick={createRoom}>
+                                                Create Room
+                                            </button>
+                                        </div>
+                                        <p className='animate-pulse mt-10 text-red-600 text-center'>Room will be deleted after 1 hour of inactivity</p>
+                                    </>
+                                )}
+                            </div>
+                        </article>
+                    </div>
+                        <footer className="flex items-center p-4 justify-center w-full max-w-[700px] mx-auto">
+                            {isInRoom && !rateLimit ? (
+                                <div className="flex w-full max-w-full">
+                                    <textarea ref={messageTextareaRef} rows={1} placeholder="Type your message..." value={message} onChange={handleMessageInputChange} className="text-base transition-all ease-out duration-200 mt-0 block resize-none bg-transparent focus:ring-0 focus-visible:ring-0 max-h-[25dvh] w-full max-w-[calc(100%-80px)] px-3 py-2 border border-gray-300 rounded-3xl custom-scrollbar" />
+                                    <button className="hover:bg-primary-white transition-all ease-out duration-200 ml-2 px-4 py-2 text-white border border-secondary-white rounded-full font-semibold focus:outline-none" onClick={sendMessage} disabled={!isInRoom} >
+                                        Send
+                                    </button>
                                 </div>
-                            </article>
-                        </div>
-                        {isInRoom && (
-                            <footer className="flex items-center p-4 justify-center">
-                                <textarea
-                                    ref={messageTextareaRef}
-                                    rows={1}
-                                    placeholder="Type your message..."
-                                    value={message}
-                                    onChange={(e) => setMessage(e.target.value)}
-                                    className="focus:bg-primary-white transition-all ease-out duration-200 mt-0 block resize-none bg-transparent focus:ring-0 focus-visible:ring-0 max-h-[25dvh] w-[40%] px-3 py-2 border border-gray-300 rounded-3xl overflow-auto custom-scrollbar"
-                                />
-                                <button
-                                    className="hover:bg-primary-white transition-all ease-out duration-200 ml-2 px-4 py-2 text-white border border-secondary-white rounded-full font-semibold focus:outline-none"
-                                    onClick={sendMessage}
-                                    disabled={!isInRoom}
-                                >
-                                    Send
-                                </button>
-                            </footer>
-                        )}
+                            ) : (
+                                <div className="text-red-500 text-center mt-4">{rateLimitMessage}</div>
+                            )}
+                        </footer>
                     </div>
                 </main>
             </div>
